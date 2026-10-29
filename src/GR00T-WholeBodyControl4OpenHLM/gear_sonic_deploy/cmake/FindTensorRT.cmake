@@ -28,7 +28,7 @@
 # ~~~
 
 if(NOT TensorRT_FIND_COMPONENTS)
-  set(TensorRT_FIND_COMPONENTS nvinfer nvinfer_plugin nvonnxparser nvparsers)
+  set(TensorRT_FIND_COMPONENTS nvinfer nvinfer_plugin nvonnxparser)
 endif()
 set(TensorRT_LIBRARIES)
 
@@ -61,6 +61,20 @@ if(EXISTS "${TensorRT_INCLUDE_DIR}/NvInferVersion.h")
   string(REGEX REPLACE "^#define NV_TENSORRT_PATCH ([0-9]+).*$" "\\1" TensorRT_VERSION_PATCH "${TensorRT_PATCH}")
   string(REGEX REPLACE "^#define NV_TENSORRT_BUILD ([0-9]+).*$" "\\1" TensorRT_VERSION_TWEAK "${TensorRT_TWEAK}")
   set(TensorRT_VERSION "${TensorRT_VERSION_MAJOR}.${TensorRT_VERSION_MINOR}.${TensorRT_VERSION_PATCH}.${TensorRT_VERSION_TWEAK}")
+  # TensorRT 10.13 headers alias NV_TENSORRT_* to TRT_*_ENTERPRISE.
+  if(NOT TensorRT_VERSION_MAJOR MATCHES "^[0-9]+$")
+    foreach(_part MAJOR MINOR PATCH BUILD)
+      file(STRINGS "${TensorRT_INCLUDE_DIR}/NvInferVersion.h" _version_line
+        REGEX "^#define TRT_${_part}_ENTERPRISE [0-9]+")
+      string(REGEX REPLACE "^#define TRT_${_part}_ENTERPRISE ([0-9]+).*" "\\1"
+        _version_${_part} "${_version_line}")
+    endforeach()
+    set(TensorRT_VERSION_MAJOR "${_version_MAJOR}")
+    set(TensorRT_VERSION_MINOR "${_version_MINOR}")
+    set(TensorRT_VERSION_PATCH "${_version_PATCH}")
+    set(TensorRT_VERSION_TWEAK "${_version_BUILD}")
+    set(TensorRT_VERSION "${TensorRT_VERSION_MAJOR}.${TensorRT_VERSION_MINOR}.${TensorRT_VERSION_PATCH}.${TensorRT_VERSION_TWEAK}")
+  endif()
 endif()
 
 function(_find_trt_component component)

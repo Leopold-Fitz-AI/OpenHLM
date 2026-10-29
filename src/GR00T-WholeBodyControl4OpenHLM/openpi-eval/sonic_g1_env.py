@@ -9,6 +9,7 @@ import numpy as np
 import zmq
 from scipy.spatial.transform import Rotation as R
 from gear_sonic.data_utils.vision_client import HeadZMQClient, WristZMQClient
+from gear_sonic.data_utils.quat_processor import QuatProcessor
 
 ########################################################
 # copy and paste the following code to SONIC codebase
@@ -228,9 +229,11 @@ class SonicG1Env:
         self._action_frame_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=num_frames_to_send))
 
         # State tracking for observation (yaw integration from measured quaternion)
-        self._prev_state_yaw: float | None = None
+        self._state_quat_processor = QuatProcessor()
         self._latest_body_state: dict | None = None
         self._latest_hand_state: dict | None = None
+        self._body_received_ns: int | None = None
+        self._hand_received_ns: int | None = None
 
         # ZMQ context (shared by all sockets)
         self._zmq_context = zmq.Context()
@@ -380,6 +383,7 @@ class SonicG1Env:
         try:
             raw = self._body_state_sub.recv(zmq.NOBLOCK)
             self._latest_body_state = msgpack.unpackb(raw[len(_BODY_TOPIC):], raw=False)
+            self._body_received_ns = time.monotonic_ns()
         except zmq.Again:
             pass
         except Exception as e:
@@ -389,10 +393,25 @@ class SonicG1Env:
         try:
             raw = self._hand_state_sub.recv(zmq.NOBLOCK)
             self._latest_hand_state = msgpack.unpackb(raw, raw=False)
+            self._hand_received_ns = time.monotonic_ns()
         except zmq.Again:
             pass
         except Exception as e:
             print(f"Error reading hand state from ZMQ: {e}")
+
+    def observation_ages(self) -> dict[str, float]:
+        """Receive ages in seconds; camera timestamps are receiver wall-clock times.
+
+        This detects missing/stalled streams, not sensor exposure alignment.
+        """
+        now = time.monotonic_ns()
+        ages = {name: (now - stamp) * 1e-9 if stamp is not None else float("inf")
+                for name, stamp in [("body", self._body_received_ns),
+                                    ("hands", self._hand_received_ns)]}
+        for name, client in [("head", self.vision_client), ("wrists", self.wrist_client)]:
+            stamp = client.get_latest_timestamp_ms() if client else None
+            ages[name] = max(0., time.time() - stamp / 1000) if stamp is not None else float("inf")
+        return ages
 
     def reset(self, default_pose=None):
         """
@@ -597,25 +616,19 @@ class SonicG1Env:
             try:
                 if self._latest_body_state is not None:
                     # Convert measured base quaternion (wxyz) to Euler angles
-                    # then compute yaw angular velocity via delta_yaw / dt
+                    # using the same timestamped processing as the recorder
                     #
                     # body state from "g1_debug" (msgpack):
                     #   base_quat_measured: wxyz quaternion of the robot body
                     #   body_q_measured:    29 joint positions in robot format order
                     #     left_leg(6), right_leg(6), waist(3), left_arm(7), right_arm(7)
                     quat_wxyz = np.array(self._latest_body_state["base_quat_measured"], dtype=np.float64)
-                    roll, pitch, yaw = _quat_wxyz_to_euler_xyz(quat_wxyz)
-
-                    if self._prev_state_yaw is not None:
-                        delta_yaw = float(yaw - self._prev_state_yaw)
-                        # Wrap delta to [-pi, pi] to handle discontinuities near ±pi
-                        delta_yaw = (delta_yaw + np.pi) % (2.0 * np.pi) - np.pi
-                        yaw_vel = delta_yaw / self._dt
-                    else:
-                        yaw_vel = 0.0
-                    self._prev_state_yaw = yaw
-
-                    state_root = np.array([roll, pitch, yaw_vel], dtype=np.float32)  # 3 dims
+                    # Match the recorder: actual sample interval, wrapped yaw,
+                    # EMA(alpha=.1), and [-2, 2] rad/s clipping. Inference can
+                    # pause observation reads, so a fixed control dt is invalid.
+                    state_root = self._state_quat_processor.process_output_yaw_vel(
+                        quat_wxyz, timestamp_ns=time.monotonic_ns()
+                    )
 
                     body_q = np.array(self._latest_body_state["body_q_measured"], dtype=np.float32)
                     state_leg_left  = body_q[0:6]    # 6 dims

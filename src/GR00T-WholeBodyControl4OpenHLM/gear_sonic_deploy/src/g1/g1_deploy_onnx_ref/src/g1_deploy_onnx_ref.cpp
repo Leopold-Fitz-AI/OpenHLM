@@ -46,6 +46,7 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
@@ -2096,9 +2097,23 @@ class G1Deploy {
           // in this case, the latency reduce to 10 frames (0.2s) instead of 50 frames (1s)
           if (current_motion_->GetEncodeMode() == 0) {
             // Reduce streamed-motion lookahead only for the G1 joint encoder mode.
-            constexpr int kG1SavedFrameObservationWindowCap = (10 - 8) * 5 + 1;
+            // Keep the original 0.2 s default; expose controlled simulation
+            // sweeps without recompiling a different frame-window constant.
+            static const double preview_seconds = []() {
+              const char* value = std::getenv("OPENHLM_PREVIEW_SECONDS");
+              const double seconds = value ? std::stod(value) : 0.2;
+              if (!std::isfinite(seconds) || seconds < 0.0 || seconds > 0.6) {
+                throw std::invalid_argument("OPENHLM_PREVIEW_SECONDS must be in [0, 0.6]");
+              }
+              std::cout << "[Reference preview] configured_seconds=" << seconds << std::endl;
+              return seconds;
+            }();
+            const char* source_preview_value = std::getenv("OPENHLM_SOURCE_PREVIEW");
+            const bool source_preview = source_preview_value && std::string(source_preview_value) == "1";
+            const int saved_window_cap = source_preview ? 11 :
+                static_cast<int>(std::lround(preview_seconds / control_dt_));
             saved_frame_for_observation_window_ =
-                std::min(saved_frame_for_observation_window_, kG1SavedFrameObservationWindowCap);
+                std::min(saved_frame_for_observation_window_, saved_window_cap);
           }
           //
 
@@ -2189,7 +2204,12 @@ class G1Deploy {
         planner_path(planner_file_path) {
       
       // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      const char* domain_value = std::getenv("OPENHLM_DDS_DOMAIN");
+      const int dds_domain = domain_value ? std::stoi(domain_value) : 0;
+      if (dds_domain < 0 || dds_domain > 230) {
+        throw std::invalid_argument("OPENHLM_DDS_DOMAIN must be in [0, 230]");
+      }
+      ChannelFactory::Instance()->Init(dds_domain, networkInterface);
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -3134,6 +3154,43 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      // Optional simulation manipulation baseline: retain learned balance,
+      // and track the right-arm reference with the existing motor PD gains.
+      // No object state or simulation forces enter this controller.
+      static const bool arm_reference_servo = []() {
+        const char* value = std::getenv("OPENHLM_ARM_REFERENCE_SERVO");
+        return value && std::string(value) == "1";
+      }();
+      static std::array<double, 7> arm_integral{};
+      if (arm_reference_servo) {
+        if (!disable_crc_check_) {
+          throw std::invalid_argument("Arm reference servo is a simulation-only experiment");
+        }
+        std::lock_guard<std::mutex> lock(current_motion_mutex_);
+        auto state = low_state_buffer_.GetDataWithTime().data;
+        if (state && current_motion_ && current_motion_->timesteps > 0 && current_motion_->name == "streamed" && operator_state.play) {
+          const int frame = std::clamp(current_frame_, 0, static_cast<int>(current_motion_->timesteps) - 1);
+          const auto* reference = current_motion_->JointPositions(frame);
+          const auto* velocity = current_motion_->JointVelocities(frame);
+          for (int i = 22; i < 29; ++i) {
+            const int j = isaaclab_to_mujoco[i];
+            const double error = reference[j] - state->motor_state()[i].q();
+            // Position-equivalent gravity compensation: <= half the motor's
+            // effort limit, rather than one angle cap for all motor sizes.
+            const double effort_limit = i >= 27 ? EFFORT_LIMIT_4010 : EFFORT_LIMIT_5020;
+            const double integral_limit = 0.5 * effort_limit / kps[i];
+            arm_integral[i - 22] = std::clamp(arm_integral[i - 22] + error * control_dt_ * 1.5, -integral_limit, integral_limit);
+            const double target = reference[j] + arm_integral[i - 22];
+            motor_command_tmp.q_target.at(i) = static_cast<float>(target);
+            motor_command_tmp.dq_target.at(i) = static_cast<float>(velocity[j]);
+            // Policy history and published diagnostics must describe the
+            // command actually sent to the motors.
+            last_action[j] = (target - default_angles[i]) / g1_action_scale[i];
+          }
+        } else {
+          arm_integral.fill(0.0);
+        }
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;

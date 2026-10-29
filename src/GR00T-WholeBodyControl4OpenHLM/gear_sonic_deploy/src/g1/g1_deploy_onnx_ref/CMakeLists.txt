@@ -233,22 +233,21 @@ else()
 endif()
 
 # test executable:
-include(FetchContent)
-
-# Download and make GoogleTest available
-FetchContent_Declare(
-  googletest
-  URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
-FetchContent_MakeAvailable(googletest)
-
-find_package(GTest REQUIRED)
+find_package(GTest QUIET)
+if(NOT GTest_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+  )
+  FetchContent_MakeAvailable(googletest)
+endif()
 
 file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
 
 add_executable(run_tests ${TEST_SRCS})
 target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
-target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
+target_link_libraries(run_tests GTest::gtest GTest::gtest_main ${EXE_LIBS})
 target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
 
 # Setting our output directory and C++ standard
